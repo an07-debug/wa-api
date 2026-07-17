@@ -108,7 +108,7 @@ async function start() {
     try {
       // Enqueued, not sent directly - this is what gives you the typing
       // simulation + randomized delay + spacing between messages.
-      queue!.enqueue(jid, text).catch((err) => logger.error(err, 'send failed'));
+      queue!.enqueue(jid, text).catch((err: any) => logger.error(err, 'send failed'));
       res.json({ queued: true });
     } catch (err) {
       logger.error(err, 'failed to queue message');
