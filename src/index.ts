@@ -14,6 +14,10 @@ import { HumanMessageQueue } from './humanSend';
 const MONGO_URI = process.env.MONGO_URI as string;
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY; // simple shared-secret for your own endpoint
+// Set this to your own WhatsApp number (with country code, digits only,
+// e.g. "919876543210") to link via an 8-character pairing code instead
+// of scanning a QR - no QR fitting/scrolling issues at all.
+const PHONE_NUMBER = process.env.PHONE_NUMBER;
 
 if (!MONGO_URI) {
   throw new Error('Set MONGO_URI in your Render environment variables.');
@@ -42,6 +46,21 @@ async function start() {
     markOnlineOnConnect: false,
     printQRInTerminal: false
   });
+
+  // If PHONE_NUMBER is set and we're not registered yet, request a pairing
+  // code instead of relying on the QR. Avoids the "QR doesn't fit in the
+  // log panel" problem entirely - you just type an 8-char code into
+  // WhatsApp on your phone.
+  if (PHONE_NUMBER && !sock.authState.creds.registered) {
+    setTimeout(async () => {
+      try {
+        const code = await sock.requestPairingCode(PHONE_NUMBER);
+        logger.info(`Pairing code: ${code} - enter this in WhatsApp > Linked Devices > Link with phone number`);
+      } catch (err) {
+        logger.error(err, 'Failed to request pairing code');
+      }
+    }, 3000); // small delay so the socket is ready before requesting
+  }
 
   queue = new HumanMessageQueue(sock, {
     minGapMs: 1500,
@@ -108,7 +127,7 @@ async function start() {
     try {
       // Enqueued, not sent directly - this is what gives you the typing
       // simulation + randomized delay + spacing between messages.
-      queue!.enqueue(jid, text).catch((err: any) => logger.error(err, 'send failed'));
+      queue!.enqueue(jid, text).catch((err) => logger.error(err, 'send failed'));
       res.json({ queued: true });
     } catch (err) {
       logger.error(err, 'failed to queue message');
