@@ -7,7 +7,6 @@ import { Boom } from '@hapi/boom';
 import express from 'express';
 import { MongoClient } from 'mongodb';
 import P from 'pino';
-import qrcode from 'qrcode-terminal';
 import { useDbAuthState } from './dbAuthState';
 import { HumanMessageQueue } from './humanSend';
 
@@ -21,6 +20,11 @@ const PHONE_NUMBER = process.env.PHONE_NUMBER;
 
 if (!MONGO_URI) {
   throw new Error('Set MONGO_URI in your Render environment variables.');
+}
+if (!PHONE_NUMBER) {
+  throw new Error(
+    'Set PHONE_NUMBER in your Render environment variables (digits only, with country code, e.g. "919876543210"). QR login has been removed - pairing code is now the only login method.'
+  );
 }
 
 const logger = P({ level: 'info' });
@@ -47,14 +51,13 @@ async function start() {
     printQRInTerminal: false
   });
 
-  // If PHONE_NUMBER is set and we're not registered yet, request a pairing
-  // code instead of relying on the QR. Avoids the "QR doesn't fit in the
-  // log panel" problem entirely - you just type an 8-char code into
-  // WhatsApp on your phone.
-  if (PHONE_NUMBER && !sock.authState.creds.registered) {
+  // Pairing code is the only login method now - no QR at all. Only
+  // requested once; once registered, DB-persisted creds handle every
+  // reconnect from here on.
+  if (!sock.authState.creds.registered) {
     setTimeout(async () => {
       try {
-        const code = await sock.requestPairingCode(PHONE_NUMBER);
+        const code = await sock.requestPairingCode(PHONE_NUMBER as string);
         logger.info(`Pairing code: ${code} - enter this in WhatsApp > Linked Devices > Link with phone number`);
       } catch (err) {
         logger.error(err, 'Failed to request pairing code');
@@ -70,13 +73,7 @@ async function start() {
   sock.ev.on('creds.update', saveCreds);
 
   sock.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
-    if (qr) {
-      // Scan this once; after that, DB-persisted creds keep you logged in
-      // across Render restarts/redeploys.
-      qrcode.generate(qr, { small: true });
-    }
+    const { connection, lastDisconnect } = update;
 
     if (connection === 'open') {
       connectionStatus = 'open';
@@ -95,7 +92,7 @@ async function start() {
         // unlinked the device from your phone).
         setTimeout(start, 2000);
       } else {
-        logger.error('Logged out - delete the session doc in MongoDB and re-scan the QR to relink.');
+        logger.error('Logged out - delete the session doc in MongoDB and restart to get a new pairing code.');
       }
     }
   });
