@@ -7,32 +7,86 @@ import { Boom } from '@hapi/boom';
 import express from 'express';
 import { MongoClient } from 'mongodb';
 import P from 'pino';
+import QRCode from 'qrcode';
 import { useDbAuthState } from './dbAuthState';
 import { HumanMessageQueue } from './humanSend';
 
 const MONGO_URI = process.env.MONGO_URI as string;
 const PORT = process.env.PORT || 3000;
-const API_KEY = process.env.API_KEY; // simple shared-secret for your own endpoint
-// Set this to your own WhatsApp number (with country code, digits only,
-// e.g. "919876543210") to link via an 8-character pairing code instead
-// of scanning a QR - no QR fitting/scrolling issues at all.
-const PHONE_NUMBER = process.env.PHONE_NUMBER;
+const API_KEY = process.env.API_KEY; // simple shared-secret for your own /send endpoint
 
 if (!MONGO_URI) {
   throw new Error('Set MONGO_URI in your Render environment variables.');
-}
-if (!PHONE_NUMBER) {
-  throw new Error(
-    'Set PHONE_NUMBER in your Render environment variables (digits only, with country code, e.g. "919876543210"). QR login has been removed - pairing code is now the only login method.'
-  );
 }
 
 const logger = P({ level: 'info' });
 
 let queue: HumanMessageQueue | null = null;
 let connectionStatus: 'connecting' | 'open' | 'close' = 'connecting';
+// Latest QR string (raw, not yet rendered as an image) - used by the /qr page.
+let latestQr: string | null = null;
 
-async function start() {
+// The HTTP server is created ONCE and never restarted. Only the WhatsApp
+// socket reconnects on its own - this avoids a real bug where re-running
+// app.listen() on every reconnect would crash with "address already in use".
+const app = express();
+app.use(express.json());
+
+app.get('/health', (_req, res) => {
+  res.json({ status: connectionStatus });
+});
+
+// Open this URL in a browser to scan the QR - far more reliable than
+// squeezing ASCII art into Render's log panel, and doesn't race an
+// expiring pairing code. The page auto-refreshes every 20s so an
+// expired QR is replaced with a fresh one automatically.
+app.get('/qr', async (_req, res) => {
+  if (connectionStatus === 'open') {
+    return res.send('<h2>Already connected - no QR needed.</h2>');
+  }
+  if (!latestQr) {
+    return res.send('<h2>Waiting for QR to generate... refreshing in 3s.</h2><script>setTimeout(()=>location.reload(),3000)</script>');
+  }
+  const dataUrl = await QRCode.toDataURL(latestQr, { width: 320 });
+  res.send(`
+    <html>
+      <head><meta http-equiv="refresh" content="20"></head>
+      <body style="display:flex;flex-direction:column;align-items:center;font-family:sans-serif;margin-top:40px;">
+        <h2>Scan with WhatsApp &gt; Linked Devices &gt; Link a Device</h2>
+        <img src="${dataUrl}" width="320" height="320" />
+        <p>This page refreshes every 20s to keep the QR current.</p>
+      </body>
+    </html>
+  `);
+});
+
+app.post('/send', async (req, res) => {
+  if (API_KEY && req.headers['x-api-key'] !== API_KEY) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+
+  const { jid, text } = req.body || {};
+  if (!jid || !text) {
+    return res.status(400).json({ error: 'jid and text are required' });
+  }
+  if (connectionStatus !== 'open') {
+    return res.status(503).json({ error: 'WhatsApp connection not open yet' });
+  }
+
+  try {
+    // Enqueued, not sent directly - this is what gives you the typing
+    // simulation + randomized delay + spacing between messages.
+    queue!.enqueue(jid, text).catch((err: any) => logger.error(err, 'send failed'));
+    res.json({ queued: true });
+  } catch (err) {
+    logger.error(err, 'failed to queue message');
+    res.status(500).json({ error: 'failed to queue message' });
+  }
+});
+
+app.listen(PORT, () => logger.info(`HTTP server listening on ${PORT}`));
+
+async function connectToWhatsApp() {
   const mongo = new MongoClient(MONGO_URI);
   await mongo.connect();
   const sessions = mongo.db('wa-api').collection('sessions');
@@ -51,20 +105,6 @@ async function start() {
     printQRInTerminal: false
   });
 
-  // Pairing code is the only login method now - no QR at all. Only
-  // requested once; once registered, DB-persisted creds handle every
-  // reconnect from here on.
-  if (!sock.authState.creds.registered) {
-    setTimeout(async () => {
-      try {
-        const code = await sock.requestPairingCode(PHONE_NUMBER as string);
-        logger.info(`Pairing code: ${code} - enter this in WhatsApp > Linked Devices > Link with phone number`);
-      } catch (err) {
-        logger.error(err, 'Failed to request pairing code');
-      }
-    }, 3000); // small delay so the socket is ready before requesting
-  }
-
   queue = new HumanMessageQueue(sock, {
     minGapMs: 1500,
     maxGapMs: 6000
@@ -73,10 +113,16 @@ async function start() {
   sock.ev.on('creds.update', saveCreds);
 
   sock.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect } = update;
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr) {
+      latestQr = qr;
+      logger.info(`QR ready - open https://<your-render-url>/qr in a browser to scan it.`);
+    }
 
     if (connection === 'open') {
       connectionStatus = 'open';
+      latestQr = null;
       logger.info('WhatsApp connection open');
     }
 
@@ -89,53 +135,17 @@ async function start() {
 
       if (!loggedOut) {
         // Reconnect on anything except an explicit logout (e.g. you
-        // unlinked the device from your phone).
-        setTimeout(start, 2000);
+        // unlinked the device from your phone). Only the socket restarts -
+        // the HTTP server above keeps running the whole time.
+        setTimeout(connectToWhatsApp, 2000);
       } else {
-        logger.error('Logged out - delete the session doc in MongoDB and restart to get a new pairing code.');
+        logger.error('Logged out - delete the session doc in MongoDB and restart to get a fresh QR.');
       }
     }
   });
-
-  // --- Minimal HTTP API -----------------------------------------------
-  const app = express();
-  app.use(express.json());
-
-  // Hit this from an uptime pinger (UptimeRobot / cron-job.org) every
-  // 5-10 min so Render's free tier doesn't spin the service down and
-  // kill the WhatsApp socket.
-  app.get('/health', (_req, res) => {
-    res.json({ status: connectionStatus });
-  });
-
-  app.post('/send', async (req, res) => {
-    if (API_KEY && req.headers['x-api-key'] !== API_KEY) {
-      return res.status(401).json({ error: 'unauthorized' });
-    }
-
-    const { jid, text } = req.body || {};
-    if (!jid || !text) {
-      return res.status(400).json({ error: 'jid and text are required' });
-    }
-    if (connectionStatus !== 'open') {
-      return res.status(503).json({ error: 'WhatsApp connection not open yet' });
-    }
-
-    try {
-      // Enqueued, not sent directly - this is what gives you the typing
-      // simulation + randomized delay + spacing between messages.
-      queue!.enqueue(jid, text).catch((err) => logger.error(err, 'send failed'));
-      res.json({ queued: true });
-    } catch (err) {
-      logger.error(err, 'failed to queue message');
-      res.status(500).json({ error: 'failed to queue message' });
-    }
-  });
-
-  app.listen(PORT, () => logger.info(`HTTP server listening on ${PORT}`));
 }
 
-start().catch((err) => {
+connectToWhatsApp().catch((err) => {
   console.error('Fatal startup error:', err);
   process.exit(1);
 });
