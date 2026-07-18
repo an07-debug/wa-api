@@ -15,6 +15,7 @@ import { HumanMessageQueue } from './humanSend';
 import { sendImage, sendDocument, sendVoiceNote } from './media';
 import { makeMessageStore, MessageStore } from './messageStore';
 import { listGroups } from './groups';
+import { DASHBOARD_HTML } from './dashboard';
 
 const MONGO_URI = process.env.MONGO_URI as string;
 const PORT = process.env.PORT || 3000;
@@ -54,6 +55,13 @@ app.use(express.json({ limit: '15mb' })); // room for base64 media in request bo
 
 app.get('/health', (_req, res) => {
   res.json({ status: connectionStatus });
+});
+
+// The dashboard: browse chats/groups, read messages, send text - all
+// from a normal webpage instead of curl. API key is entered once and
+// saved in this browser's localStorage.
+app.get('/', (_req, res) => {
+  res.send(DASHBOARD_HTML);
 });
 
 // Scan this in a browser - far more reliable than terminal ASCII art.
@@ -110,6 +118,15 @@ app.post('/send-media', async (req, res) => {
     logger.error(err, 'media send failed');
     res.status(500).json({ error: err.message || 'media send failed' });
   }
+});
+
+// List recent chats (distinct jids) with a preview of the last message.
+app.get('/chats', async (req, res) => {
+  if (!requireAuth(req, res)) return;
+  if (!messageStore) return res.status(503).json({ error: 'not ready yet' });
+
+  const chats = await messageStore.listChats(50);
+  res.json({ chats });
 });
 
 // Fetch recent stored messages for a chat (personal-use inbox read).
